@@ -1,24 +1,72 @@
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger
+from __future__ import annotations
 
-@register("helloworld", "YourName", "一个简单的 Hello World 插件", "1.0.0")
-class MyPlugin(Star):
+import os
+import uuid
+
+import aiohttp
+from astrbot.api import logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import LLMResponse
+from astrbot.api.star import Context, Star, register
+
+
+@register(
+    "astrbot_plugin_token_collector",
+    "Token 用量采集器",
+    "采集 LLM token 用量上报到管理后台",
+    "2.0.0",
+)
+class TokenCollectorPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        self.backend_url = os.environ.get(
+            "TOKEN_COLLECTOR_BACKEND_URL",
+            "http://127.0.0.1:8848",
+        ).rstrip("/")
+        self.report_endpoint = f"{self.backend_url}/api/v1/token/report"
+        logger.info(f"TokenCollectorPlugin 已加载，上报地址: {self.report_endpoint}")
 
-    async def initialize(self):
-        """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
+    @filter.on_llm_response()
+    async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
+        """LLM 请求完成后，截获 token 用量并上报。"""
+        if not resp or not resp.usage:
+            return
 
-    # 注册指令的装饰器。指令名为 helloworld。注册成功后，发送 `/helloworld` 就会触发这个指令，并回复 `你好, {user_name}!`
-    @filter.command("helloworld")
-    async def helloworld(self, event: AstrMessageEvent):
-        """这是一个 hello world 指令""" # 这是 handler 的描述，将会被解析方便用户了解插件内容。建议填写。
-        user_name = event.get_sender_name()
-        message_str = event.message_str # 用户发的纯文本消息字符串
-        message_chain = event.get_messages() # 用户所发的消息的消息链 # from astrbot.api.message_components import *
-        logger.info(message_chain)
-        yield event.plain_result(f"Hello, {user_name}, 你发了 {message_str}!") # 发送一条纯文本消息
+        provider = self.context.get_using_provider(event.unified_msg_origin)
+        provider_config = getattr(provider, "provider_config", {}) or {}
+        usage = resp.usage
+        provider_id = str(provider_config.get("id", "")).strip() or "unknown"
+        provider_model = (
+            getattr(provider, "get_model", lambda: "")() if provider else ""
+        ) or str(provider_config.get("model", "")).strip() or "unknown"
+        token_input_cached = int(getattr(usage, "input_cached", 0) or 0)
+        token_input_other = int(getattr(usage, "input_other", 0) or 0)
+        token_output = int(getattr(usage, "output", 0) or 0)
+        request_id = getattr(resp, "id", None) or uuid.uuid4().hex
 
-    async def terminate(self):
-        """可选择实现异步的插件销毁方法，当插件被卸载/停用时会调用。"""
+        payload = {
+            "platform": "weixin_oc",
+            "session_id": event.unified_msg_origin,
+            "conversation_id": event.unified_msg_origin,
+            "user_id": event.get_sender_id(),
+            "request_id": str(request_id),
+            "provider_id": provider_id,
+            "provider_model": provider_model,
+            "token_input_cached": token_input_cached,
+            "token_input_other": token_input_other,
+            "token_output": token_output,
+            "status": "completed",
+            "source": "plugin",
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(self.report_endpoint, json=payload) as response:
+                    if response.status >= 400:
+                        body = await response.text()
+                        logger.error(
+                            f"Token 上报失败: status={response.status}, body={body}, payload={payload}"
+                        )
+        except Exception as exc:
+            logger.error(f"Token 上报失败: {exc}")
