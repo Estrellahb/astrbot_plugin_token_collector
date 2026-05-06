@@ -1,5 +1,5 @@
 name: astrbot_plugin_token_collector
 display_name: Token 用量采集器
 desc: "采集每次 LLM 调用的 token 用量并上报到管理后台，用于按机器人统计和计费。"
-version: "2.0.0"
+version: "2.0.1"
 author: "admin"

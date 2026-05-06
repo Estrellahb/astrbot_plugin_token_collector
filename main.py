@@ -26,6 +26,27 @@ class TokenCollectorPlugin(Star):
         self.report_endpoint = f"{self.backend_url}/api/v1/token/report"
         logger.info(f"TokenCollectorPlugin 已加载，上报地址: {self.report_endpoint}")
 
+    @staticmethod
+    def _normalize_provider_id(raw_provider_id: str, provider_model: str) -> str:
+        """
+        将 AstrBot 侧可能包含模型名的 provider id 收口为供应商 id。
+
+        例如：
+        - deepseek/deepseek-v4-pro -> deepseek
+        - openai/gpt-4.1-mini -> openai
+        """
+        value = raw_provider_id.strip()
+        if not value:
+            return "unknown"
+        parts = [part.strip() for part in value.split("/") if part.strip()]
+        if not parts:
+            return "unknown"
+        if len(parts) == 1:
+            return parts[0]
+        if provider_model and parts[-1] == provider_model:
+            return parts[0]
+        return parts[0]
+
     @filter.on_llm_response()
     async def on_llm_response(self, event: AstrMessageEvent, resp: LLMResponse):
         """LLM 请求完成后，截获 token 用量并上报。"""
@@ -35,10 +56,13 @@ class TokenCollectorPlugin(Star):
         provider = self.context.get_using_provider(event.unified_msg_origin)
         provider_config = getattr(provider, "provider_config", {}) or {}
         usage = resp.usage
-        provider_id = str(provider_config.get("id", "")).strip() or "unknown"
         provider_model = (
             getattr(provider, "get_model", lambda: "")() if provider else ""
         ) or str(provider_config.get("model", "")).strip() or "unknown"
+        provider_id = self._normalize_provider_id(
+            str(provider_config.get("id", "")).strip(),
+            provider_model,
+        )
         token_input_cached = int(getattr(usage, "input_cached", 0) or 0)
         token_input_other = int(getattr(usage, "input_other", 0) or 0)
         token_output = int(getattr(usage, "output", 0) or 0)
